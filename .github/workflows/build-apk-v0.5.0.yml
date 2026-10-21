@@ -1,0 +1,135 @@
+name: Build NightRaven APK from Release ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag GitHub Release that contains the source ZIP (example: v0.5.0)'
+        required: true
+        type: string
+        default: 'v0.5.0'
+      source_asset:
+        description: 'Exact source ZIP asset filename in that release'
+        required: true
+        type: string
+        default: 'NightRaven-AI-Companion-v0.5.0-2d-vtuber.zip'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android API 35 and build tools
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v5.0.2
+
+      - name: Download source ZIP from the selected GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Validate inputs before using them in shell commands or paths.
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$SOURCE_ASSET" =~ ^[A-Za-z0-9._-]+\.zip$ ]] || {
+            echo "Source asset must be a ZIP filename without directory separators." >&2
+            exit 1
+          }
+
+          BUILD_ROOT="$RUNNER_TEMP/nightraven-release-build"
+          DOWNLOAD_DIR="$BUILD_ROOT/download"
+          EXTRACT_DIR="$BUILD_ROOT/source"
+          mkdir -p "$DOWNLOAD_DIR" "$EXTRACT_DIR"
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SOURCE_ASSET" \
+            --dir "$DOWNLOAD_DIR"
+
+          ZIP_PATH="$DOWNLOAD_DIR/$SOURCE_ASSET"
+          test -s "$ZIP_PATH"
+          unzip -tq "$ZIP_PATH"
+          unzip -q "$ZIP_PATH" -d "$EXTRACT_DIR"
+
+          SETTINGS_FILE="$(find "$EXTRACT_DIR" -type f -path '*/android/settings.gradle.kts' -print -quit)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "Could not find android/settings.gradle.kts inside the release ZIP." >&2
+            echo "Check that SOURCE_ASSET points to the NightRaven source ZIP, not an APK." >&2
+            exit 1
+          fi
+
+          ANDROID_DIR="$(dirname "$SETTINGS_FILE")"
+          test -f "$ANDROID_DIR/app/build.gradle.kts"
+          test -f "$ANDROID_DIR/gradlew"
+          chmod +x "$ANDROID_DIR/gradlew"
+
+          SAFE_TAG="${RELEASE_TAG//[^A-Za-z0-9._-]/-}"
+          APK_NAME="NightRaven-${SAFE_TAG}-debug.apk"
+          {
+            echo "ANDROID_DIR=$ANDROID_DIR"
+            echo "RELEASE_TAG=$RELEASE_TAG"
+            echo "APK_NAME=$APK_NAME"
+          } >> "$GITHUB_ENV"
+
+          echo "Source ZIP extracted. Android project directory: $ANDROID_DIR"
+
+      - name: Run unit tests and build installable debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ANDROID_DIR"
+          ./gradlew --no-daemon testDebugUnitTest assembleDebug
+
+          BUILT_APK="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$BUILT_APK"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$BUILT_APK" "$GITHUB_WORKSPACE/dist/$APK_NAME"
+          echo "Built APK: dist/$APK_NAME"
+
+      - name: Upload APK as a downloadable Actions artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: nightraven-debug-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach APK to the same GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_PATH="$GITHUB_WORKSPACE/dist/$APK_NAME"
+          test -s "$APK_PATH"
+          gh release upload "$RELEASE_TAG" "$APK_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+          echo "Uploaded $APK_NAME to release $RELEASE_TAG"
